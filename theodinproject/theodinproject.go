@@ -1,10 +1,4 @@
-// Package theodinproject is the library behind the theodinproject command line:
-// the HTTP client, request shaping, and the typed data models for theodinproject.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Package theodinproject is the library behind the theodinproject CLI.
 package theodinproject
 
 import (
@@ -12,41 +6,155 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to theodinproject. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "theodinproject/dev (+https://github.com/tamnd/theodinproject-cli)"
+const DefaultUserAgent = "theodinproject-cli/dev (+https://github.com/tamnd/theodinproject-cli)"
 
-// Client talks to theodinproject over HTTP.
-type Client struct {
-	HTTP      *http.Client
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://www.theodinproject.com",
+		Rate:      500 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+var (
+	pathRe   = regexp.MustCompile(`href="/paths/([\w-]+)"[^>]*>\s*<h2[^>]*>([\s\S]*?)</h2>`)
+	h3Re     = regexp.MustCompile(`<h3[^>]*>([^<]+)</h3>`)
+	lessonRe = regexp.MustCompile(`/lessons/([\w-]+)"[^>]*>[\s\S]*?<p class="text-gray[^"]*">([^<]+)</p>`)
+	tagRe    = regexp.MustCompile(`<[^>]+>`)
+)
+
+// Paths fetches the /paths page and returns all learning paths.
+func (c *Client) Paths(ctx context.Context) ([]*Path, error) {
+	body, err := c.get(ctx, c.cfg.BaseURL+"/paths")
+	if err != nil {
+		return nil, err
+	}
+	html := string(body)
+
+	var paths []*Path
+	rank := 0
+	for _, m := range pathRe.FindAllStringSubmatch(html, -1) {
+		rank++
+		title := strings.TrimSpace(tagRe.ReplaceAllString(m[2], ""))
+		paths = append(paths, &Path{
+			Rank:  rank,
+			Slug:  m[1],
+			Title: title,
+			URL:   c.cfg.BaseURL + "/paths/" + m[1],
+		})
+	}
+	return paths, nil
+}
+
+// Lessons fetches a path page and returns all lessons grouped by course.
+func (c *Client) Lessons(ctx context.Context, pathSlug string) ([]*Lesson, error) {
+	body, err := c.get(ctx, c.cfg.BaseURL+"/paths/"+pathSlug)
+	if err != nil {
+		return nil, err
+	}
+	html := string(body)
+
+	sections := splitByCourse(html)
+
+	var lessons []*Lesson
+	rank := 0
+	for _, sec := range sections {
+		course := sec.course
+		for _, m := range lessonRe.FindAllStringSubmatch(sec.html, -1) {
+			rank++
+			slug := m[1]
+			title := strings.TrimSpace(m[2])
+			lessons = append(lessons, &Lesson{
+				Rank:   rank,
+				Slug:   slug,
+				Course: course,
+				Title:  title,
+				URL:    c.cfg.BaseURL + "/lessons/" + slug,
+			})
+		}
+	}
+	return lessons, nil
+}
+
+type courseSection struct {
+	course string
+	html   string
+}
+
+func splitByCourse(html string) []courseSection {
+	h3Matches := h3Re.FindAllStringSubmatchIndex(html, -1)
+	var sections []courseSection
+	curCourse := ""
+	curStart := 0
+
+	for _, m := range h3Matches {
+		h3Text := strings.TrimSpace(html[m[2]:m[3]])
+		if isFooterH3(h3Text) {
+			continue
+		}
+		if curCourse != "" {
+			end := m[0]
+			sections = append(sections, courseSection{course: curCourse, html: html[curStart:end]})
+		}
+		curCourse = h3Text
+		curStart = m[1]
+	}
+	if curCourse != "" {
+		sections = append(sections, courseSection{course: curCourse, html: html[curStart:]})
+	}
+	return sections
+}
+
+var footerH3s = map[string]bool{
+	"About us": true, "Support": true, "Guides": true, "Legal": true,
+}
+
+func isFooterH3(s string) bool { return footerH3s[s] }
+
+// Info returns site-level stats.
+func (c *Client) Info(ctx context.Context) (*Info, error) {
+	paths, err := c.Paths(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Info{
+		Site:   "www.theodinproject.com",
+		Paths:  len(paths),
+		Source: c.cfg.BaseURL,
+	}, nil
+}
+
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -66,15 +174,15 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	return nil, fmt.Errorf("get %s: %w", url, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, url string) ([]byte, bool, error) {
 	c.pace()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -86,7 +194,6 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, true, err
@@ -94,12 +201,11 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
